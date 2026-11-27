@@ -20,7 +20,7 @@ All data is synthetic.
 ## Status
 
 - [x] Phase 0: Setup
-- [ ] Phase 1: Ledger
+- [x] Phase 1: Ledger
 - [ ] Phase 2: Load test
 - [ ] Phase 3: Fake partner file generator
 - [ ] Phase 4: Reconciliation engine
@@ -41,7 +41,30 @@ Check it works: open http://localhost:8000/health and you should see `{"status":
 
 ## Run tests
 
+Tests need Postgres, so run them inside Docker (each run uses its own throwaway database, your data is never touched):
+
 ```
-pip install -r requirements.txt
-pytest
+docker compose run --rm api pytest -q
 ```
+
+## The ledger (Phase 1)
+
+Money is stored as whole pesewas (GH₵1 = 100), never decimals.
+
+| Rule | How it's enforced |
+|---|---|
+| Debits and credits always sum to zero | Each transfer writes two signed entries (-amount, +amount) in one database transaction |
+| No double charging on retries | `Idempotency-Key` header, backed by a UNIQUE column so even simultaneous retries create only one transfer |
+| No overdrafts or lost money under concurrency | Both accounts are locked (`SELECT ... FOR UPDATE`) in id order, so no overdraft and no deadlocks |
+| Entries are never edited | A database trigger blocks UPDATE and DELETE on `entries`. Fixes are new entries |
+| Books can be audited | `GET /audit/integrity` checks totals and cached balances |
+
+Try it (interactive docs at http://localhost:8000/docs):
+
+```
+POST /accounts       {"name": "bank-cash", "allow_negative": true}
+POST /accounts       {"name": "alice"}
+POST /transfers      header Idempotency-Key: abc-1
+                     {"from_account_id": 1, "to_account_id": 2, "amount": 50000}
+```
+Send the same transfer again with the same key: you get the same transaction back and Alice is only charged once.
