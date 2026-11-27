@@ -1,6 +1,7 @@
 """Ledger business logic. All the money rules live here."""
 import hashlib
 from dataclasses import dataclass
+from datetime import datetime
 
 from sqlalchemy import func, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
@@ -30,8 +31,16 @@ class IdempotencyConflict(LedgerError):
 
 
 @dataclass
+class TransactionInfo:
+    id: int
+    idempotency_key: str
+    reference: str | None
+    created_at: datetime
+
+
+@dataclass
 class TransferResult:
-    transaction: LedgerTransaction
+    transaction: "TransactionInfo | LedgerTransaction"
     from_account_id: int
     to_account_id: int
     amount: int
@@ -47,7 +56,10 @@ def _result_from_transaction(db: Session, tx: LedgerTransaction, replayed: bool)
     entries = db.execute(select(Entry).where(Entry.transaction_id == tx.id)).scalars().all()
     out = next(e for e in entries if e.amount < 0)
     inn = next(e for e in entries if e.amount > 0)
-    return TransferResult(tx, out.account_id, inn.account_id, inn.amount, replayed)
+    # Copy into a plain object: the session is closed after the request, and a closed
+    # session can't lazily reload database rows.
+    info = TransactionInfo(tx.id, tx.idempotency_key, tx.reference, tx.created_at)
+    return TransferResult(info, out.account_id, inn.account_id, inn.amount, replayed)
 
 
 def create_account(db: Session, name: str, allow_negative: bool = False) -> Account:
@@ -80,11 +92,11 @@ def transfer(
             pg_insert(LedgerTransaction)
             .values(idempotency_key=idempotency_key, request_hash=req_hash, reference=reference)
             .on_conflict_do_nothing(index_elements=["idempotency_key"])
-            .returning(LedgerTransaction.id)
+            .returning(LedgerTransaction.id, LedgerTransaction.created_at)
         )
-        new_tx_id = db.execute(stmt).scalar_one_or_none()
+        inserted = db.execute(stmt).first()
 
-        if new_tx_id is None:
+        if inserted is None:
             # Key already used. Same request = replay the old answer. Different = error.
             existing = db.execute(
                 select(LedgerTransaction).where(LedgerTransaction.idempotency_key == idempotency_key)
@@ -119,6 +131,7 @@ def transfer(
             raise InsufficientFunds("Insufficient funds")
 
         # STEP 4: write the two entries (they sum to zero) and update cached balances
+        new_tx_id, created_at = inserted
         db.add(Entry(transaction_id=new_tx_id, account_id=sender.id, amount=-amount))
         db.add(Entry(transaction_id=new_tx_id, account_id=receiver.id, amount=amount))
         sender.balance -= amount
@@ -130,7 +143,9 @@ def transfer(
         db.rollback()
         raise
 
-    tx = db.get(LedgerTransaction, new_tx_id)
+    # Built from the INSERT's own RETURNING values: no extra query after commit, so no
+    # connection is held after we're done.
+    tx = TransactionInfo(new_tx_id, idempotency_key, reference, created_at)
     return TransferResult(tx, from_account_id, to_account_id, amount, replayed=False)
 
 
@@ -157,9 +172,18 @@ def integrity_report(db: Session) -> dict:
         .where(Account.balance != func.coalesce(sums.c.s, 0))
     ).scalars().all()
 
+    # Normal accounts must never be below zero (should be none)
+    overdrawn = db.execute(
+        select(Account.id).where(Account.balance < 0, Account.allow_negative.is_(False))
+    ).scalars().all()
+
+    transaction_count = db.execute(select(func.count(LedgerTransaction.id))).scalar_one()
+
     return {
-        "ok": total == 0 and not unbalanced and not mismatched,
+        "ok": total == 0 and not unbalanced and not mismatched and not overdrawn,
         "total_of_all_entries": total,
+        "transaction_count": transaction_count,
         "unbalanced_transactions": list(unbalanced),
         "accounts_with_balance_mismatch": list(mismatched),
+        "overdrawn_accounts": list(overdrawn),
     }

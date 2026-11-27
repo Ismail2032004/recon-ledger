@@ -196,3 +196,12 @@ def test_opposite_direction_transfers_do_not_deadlock(session_factory, make_acco
 def test_books_balance_after_all_that(db):
     report = service.integrity_report(db)
     assert report["ok"], report
+
+
+def test_integrity_report_has_counts(db, make_account):
+    a, b = make_account(balance=500), make_account()
+    before = service.integrity_report(db)["transaction_count"]
+    service.transfer(db, key(), a.id, b.id, 100)
+    report = service.integrity_report(db)
+    assert report["transaction_count"] == before + 1
+    assert report["overdrawn_accounts"] == []

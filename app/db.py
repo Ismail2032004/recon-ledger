@@ -1,4 +1,5 @@
 import os
+from contextlib import contextmanager
 
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
@@ -13,8 +14,12 @@ def get_database_url() -> str:
 
 
 def make_engine(url: str | None = None):
-    # pool_size is a bit above the default so the concurrent tests have room
-    return create_engine(url or get_database_url(), pool_size=20, max_overflow=20)
+    return create_engine(
+        url or get_database_url(),
+        pool_size=int(os.getenv("DB_POOL_SIZE", "40")),
+        max_overflow=0,
+        pool_timeout=int(os.getenv("DB_POOL_TIMEOUT", "30")),
+    )
 
 
 _engine = None
@@ -30,8 +35,14 @@ def get_session_factory():
     return _SessionLocal
 
 
-def get_db():
-    """FastAPI dependency: one database session per request."""
+@contextmanager
+def session_scope():
+    """One database session per request, opened AND closed inside the request's own thread.
+
+    (We deliberately do not use a FastAPI "yield" dependency for this: its cleanup needs a
+    free worker thread, and under heavy load that can deadlock against the connection pool.
+    Rule: connections in use can never outnumber worker threads. See DB_POOL_SIZE / API_THREADS.)
+    """
     db = get_session_factory()()
     try:
         yield db

@@ -21,7 +21,7 @@ All data is synthetic.
 
 - [x] Phase 0: Setup
 - [x] Phase 1: Ledger
-- [ ] Phase 2: Load test
+- [x] Phase 2: Load test
 - [ ] Phase 3: Fake partner file generator
 - [ ] Phase 4: Reconciliation engine
 - [ ] Phase 5: AI agent
@@ -68,3 +68,49 @@ POST /transfers      header Idempotency-Key: abc-1
                      {"from_account_id": 1, "to_account_id": 2, "amount": 50000}
 ```
 Send the same transfer again with the same key: you get the same transaction back and Alice is only charged once.
+
+## Load test (Phase 2)
+
+200 simulated users hit the API at the same time for 30 seconds, mixing normal transfers, payments into one shared "merchant" account (everyone fighting over the same row), retries with the same Idempotency-Key, overdraw attempts, and a few low-balance accounts that many users try to drain at once. When it stops, the test checks the books.
+
+```
+docker compose --profile loadtest run --rm loadtest
+```
+
+Results are written to [loadtest/results/latest.md](loadtest/results/latest.md). What it proves:
+
+| Check | Why it matters |
+|---|---|
+| All entries sum to zero, cached balances match entries | Money is never created or lost |
+| Transaction count equals the number of successful new transfers | Retries never double-post, nothing is lost |
+| Customers + merchant hold exactly what was funded | Money is conserved |
+| Low-balance accounts never go negative and never pay out more than they hold | No overdrafts under concurrency |
+| Every retry replays the original result, every overdraw is declined | Idempotency and funds checks hold under load |
+
+### Latest results
+
+200 concurrent users for 30 seconds, one API worker, running in Docker on a laptop.
+
+| Metric | Value |
+|---|---|
+| Total requests | 2,358 |
+| New transfers posted | 1,685 |
+| Declined (insufficient funds, expected) | 382 |
+| Requests per second | 76 |
+| Median latency | 2300 ms |
+| 95th percentile latency | 4900 ms |
+| Unexpected errors | 0 |
+
+| Correctness check | Result |
+|---|---|
+| Books balance (all entries sum to 0) | PASS |
+| Cached balances match entries | PASS |
+| No account overdrawn | PASS |
+| Transaction count matches successful transfers (no double posting, none lost) | PASS |
+| Money conserved | PASS |
+| Low-balance accounts never negative, never pay out more than they hold | PASS |
+| Every retry replayed, every overdraw declined | PASS |
+
+**Overall: PASS**
+
+*This test measures correctness under concurrency, not raw speed. Latency is high because all 200 users share a single API worker.*
